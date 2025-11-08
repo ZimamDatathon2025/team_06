@@ -1,0 +1,571 @@
+WITH icu_stays AS (
+SELECT subject_id, hadm_id, stay_id, intime, outtime
+FROM `physionet-data.mimiciv_3_1_icu.icustays`
+WHERE outtime IS NOT NULL
+),
+icu_units AS (
+SELECT DISTINCT careunit AS icu_unit
+FROM `physionet-data.mimiciv_3_1_hosp.transfers`
+WHERE careunit IS NOT NULL AND LOWER(careunit) LIKE '%icu%'
+),
+first_after_icu AS (
+SELECT
+s.subject_id, s.hadm_id, s.stay_id,
+s.outtime AS t0_transfer,
+ARRAY_AGG(STRUCT(t.careunit, t.intime, t.outtime) ORDER BY t.intime ASC)[SAFE_OFFSET(0)] AS seg
+FROM icu_stays s
+JOIN `physionet-data.mimiciv_3_1_hosp.transfers` t
+ON t.subject_id=s.subject_id AND t.hadm_id=s.hadm_id AND t.intime >= s.outtime
+GROUP BY s.subject_id, s.hadm_id, s.stay_id, s.outtime
+),
+labeled_dest AS (
+SELECT
+f.subject_id, f.hadm_id, f.stay_id, f.t0_transfer,
+f.seg.careunit AS first_careunit_after_icu,
+CASE WHEN u.icu_unit IS NULL THEN 1 ELSE 0 END AS to_floor
+FROM first_after_icu f
+LEFT JOIN icu_units u ON f.seg.careunit = u.icu_unit
+),
+next_icu AS (
+SELECT
+i.subject_id, i.hadm_id, i.stay_id, i.t0_transfer,
+MIN(s2.intime) AS next_icu_in
+FROM labeled_dest i
+LEFT JOIN `physionet-data.mimiciv_3_1_icu.icustays` s2
+ON s2.subject_id=i.subject_id AND s2.hadm_id=i.hadm_id AND s2.intime > i.t0_transfer
+GROUP BY i.subject_id, i.hadm_id, i.stay_id, i.t0_transfer
+)
+SELECT
+d.subject_id, d.hadm_id, d.stay_id, d.t0_transfer,
+d.first_careunit_after_icu, d.to_floor,
+CASE WHEN n.next_icu_in IS NOT NULL
+AND TIMESTAMP_DIFF(n.next_icu_in, d.t0_transfer, HOUR) BETWEEN 0 AND 24
+THEN 1 ELSE 0 END AS label_icu_readmit_24h,
+CASE WHEN n.next_icu_in IS NOT NULL
+AND TIMESTAMP_DIFF(n.next_icu_in, d.t0_transfer, HOUR) BETWEEN 0 AND 72
+THEN 1 ELSE 0 END AS label_icu_readmit_72h
+FROM labeled_dest d
+LEFT JOIN next_icu n USING (subject_id, hadm_id, stay_id, t0_transfer)
+WHERE d.to_floor = 1;
+
+**2) 30-day unplanned readmission after hospital discharge**
+
+WITH a AS (
+SELECT subject_id, hadm_id, admittime, dischtime, admission_type
+FROM `physionet-data.mimiciv_3_1_hosp.admissions`
+),
+seq AS (
+SELECT
+subject_id, hadm_id, dischtime,
+LEAD(hadm_id)        OVER (PARTITION BY subject_id ORDER BY admittime) AS next_hadm_id,
+LEAD(admittime)      OVER (PARTITION BY subject_id ORDER BY admittime) AS next_admittime,
+LEAD(admission_type) OVER (PARTITION BY subject_id ORDER BY admittime) AS next_admission_type
+FROM a
+)
+SELECT
+subject_id, hadm_id, dischtime AS t0_discharge,
+CASE
+WHEN next_admittime IS NOT NULL
+AND TIMESTAMP_DIFF(next_admittime, dischtime, DAY) BETWEEN 0 AND 30
+AND LOWER(next_admission_type) NOT LIKE '%elective%'
+THEN 1 ELSE 0 END AS label_readmit_30d_unplanned
+FROM seq;
+
+**Vital-sign instability in last 6h (CV of HR, RR, MAP) + last values**
+
+WITH idx AS (
+-- Replace this block with the actual ICU→floor query or an existing table/view
+SELECT subject_id, hadm_id, stay_id, outtime AS t0_transfer
+FROM `physionet-data.mimiciv_3_1_icu.icustays`
+WHERE outtime IS NOT NULL
+),
+vital_items AS (
+SELECT itemid, 'HR'  AS var FROM `physionet-data.mimiciv_3_1_icu.d_items` WHERE LOWER(label) = 'heart rate'
+UNION ALL SELECT itemid, 'RR'  FROM `physionet-data.mimiciv_3_1_icu.d_items` WHERE LOWER(label) = 'respiratory rate'
+UNION ALL SELECT itemid, 'MAP' FROM `physionet-data.mimiciv_3_1_icu.d_items`
+WHERE LOWER(label) IN ('non invasive blood pressure mean','mean bp','map (mmhg)')
+),
+win AS (
+SELECT
+i.subject_id, i.hadm_id, i.stay_id, i.t0_transfer,
+vi.var, c.charttime, c.valuenum
+FROM idx i
+JOIN `physionet-data.mimiciv_3_1_icu.chartevents` c
+ON c.subject_id=i.subject_id AND c.hadm_id=i.hadm_id AND c.stay_id=i.stay_id
+JOIN vital_items vi ON vi.itemid=c.itemid
+WHERE c.valuenum IS NOT NULL
+AND c.charttime >= TIMESTAMP_SUB(i.t0_transfer, INTERVAL 6 HOUR)
+AND c.charttime <  i.t0_transfer
+),
+packed AS (
+SELECT
+subject_id, hadm_id, stay_id, t0_transfer, var,
+ARRAY_AGG(valuenum ORDER BY charttime) AS vals,
+ARRAY_REVERSE(ARRAY_AGG(valuenum ORDER BY charttime))[SAFE_OFFSET(0)] AS last_val
+FROM win
+GROUP BY subject_id, hadm_id, stay_id, t0_transfer, var
+)
+SELECT
+subject_id, hadm_id, stay_id, t0_transfer,
+MAX(IF(var='HR',  last_val, NULL))  AS hr_last,
+MAX(IF(var='RR',  last_val, NULL))  AS rr_last,
+MAX(IF(var='MAP', last_val, NULL))  AS map_last,
+MAX(IF(var='HR',  (SELECT SAFE_DIVIDE(STDDEV_SAMP(x), NULLIF(AVG(x),0))
+FROM UNNEST(vals) x), NULL))  AS hr_cv6h,
+MAX(IF(var='RR',  (SELECT SAFE_DIVIDE(STDDEV_SAMP(x), NULLIF(AVG(x),0))
+FROM UNNEST(vals) x), NULL))  AS rr_cv6h,
+MAX(IF(var='MAP', (SELECT SAFE_DIVIDE(STDDEV_SAMP(x), NULLIF(AVG(x),0))
+FROM UNNEST(vals) x), NULL))  AS map_cv6h
+FROM packed
+GROUP BY subject_id, hadm_id, stay_id, t0_transfer;
+
+**Time since last intervention before transfer (extubation & pressors-off)**
+
+Use Cases:
+Real-Time ICU Discharge Triage Tool
+
+### Use Case A: Real-Time ICU Discharge Triage Tool
+
+- **Action:** Integrate the model's predictive score (based on last 6 hours of vital sign variability, HRV, and vasopressor status) directly into the electronic health record (EHR) *discharge summary checklist*.
+- **Result:** Before a discharge order is finalized, the system flags the patient as **"High Risk"** or **"Low Risk"** for readmission.
+- **Business Outcome:** Prevents premature transfers by making hidden instability visible.
+
+### Use Case B: ICU-to-Floor Transfer Protocol Standardization
+
+- **Action:** Enforce a new hospital-wide policy based on your **Optimal Observation Period** finding (e.g., "All patients must be off vasopressors for a minimum of 36 hours before floor transfer").
+- **Result:** Reduces variability in physician practice and ensures a standardized, evidence-based recovery period after major intervention.
+- **Business Outcome:** Reduces avoidable readmissions, leading to lower costs and improved quality scores.
+
+### Use Case C: Targeted Post-ICU Care Disparities Program
+
+- **Action:** Use the disparity analysis to identify groups (e.g., a specific minority group, or patients with multiple prior admissions) who are statistically more likely to return to the ICU.
+- **Result:** Automatically enroll high-risk, vulnerable patients into an **intensive Post-ICU Follow-up Clinic** or a **tele-ICU monitoring program** for the 30 days post-discharge.
+- **Business Outcome:** Provides a data-justified way to allocate costly extended monitoring to those who will benefit most, improving equity and patient safety.
+
+## ICU Transfer Safety Gate
+
+**Goal:** Identify patients discharged from ICU who return to ICU within 24h (rapid bounce).
+
+```
+WITH icu_stays AS (
+  SELECT subject_id, hadm_id, stay_id, intime, outtime
+  FROM `physionet-data.mimiciv_3_1_icu.icustays`
+  WHERE outtime IS NOT NULL
+),
+next_icu AS (
+  SELECT
+    a.subject_id,
+    a.hadm_id,
+    a.stay_id,
+    a.outtime AS t0_transfer,
+    MIN(b.intime) AS next_icu_in
+  FROM icu_stays a
+  LEFT JOIN `physionet-data.mimiciv_3_1_icu.icustays` b
+    ON a.subject_id = b.subject_id
+   AND a.hadm_id   = b.hadm_id
+   AND b.intime    > a.outtime
+  GROUP BY a.subject_id, a.hadm_id, a.stay_id, a.outtime
+),
+patient_info AS (
+  SELECT
+    p.subject_id,
+    p.gender,
+    p.anchor_age,
+    p.anchor_year,
+    p.dod,                        -- date of death (if any)
+    a.hadm_id,
+    a.admittime,
+    a.dischtime,
+    a.deathtime,
+    a.insurance
+  FROM `physionet-data.mimiciv_3_1_hosp.patients` p
+  JOIN `physionet-data.mimiciv_3_1_hosp.admissions` a
+    ON p.subject_id = a.subject_id
+)
+SELECT
+  n.subject_id,
+  n.hadm_id,
+  n.stay_id,
+  n.t0_transfer,
+  n.next_icu_in,
+  TIMESTAMP_DIFF(n.next_icu_in, n.t0_transfer, HOUR) AS hours_to_next_icu,
+  -- patient details
+  pi.gender,
+  pi.insurance,
+  pi.admittime,
+  pi.dischtime,
+  pi.deathtime,
+  pi.dod,
+  -- age at transfer using MIMIC-IV deidentification anchors
+  SAFE_CAST(pi.anchor_age AS INT64)
+    + (EXTRACT(YEAR FROM n.t0_transfer) - pi.anchor_year) AS age_at_transfer
+FROM next_icu n
+JOIN patient_info pi
+  ON n.subject_id = pi.subject_id
+ AND n.hadm_id   = pi.hadm_id
+WHERE n.next_icu_in IS NOT NULL
+  AND TIMESTAMP_DIFF(n.next_icu_in, n.t0_transfer, HOUR) BETWEEN 0 AND 48
+ORDER BY n.subject_id, n.hadm_id, n.t0_transfer;
+
+```
+
+## 2. High-Risk Discharge Follow-Up
+
+**Goal:** Predict 30-day unplanned readmissions and identify high-risk patients for tele-follow-up.
+
+```
+WITH adm AS (
+  SELECT subject_id, hadm_id, admittime, dischtime, admission_type
+  FROM `physionet-data.mimiciv_3_1_hosp.admissions`
+),
+seq AS (
+  SELECT
+    subject_id, hadm_id, dischtime,
+    LEAD(admittime) OVER (PARTITION BY subject_id ORDER BY admittime) AS next_admittime,
+    LEAD(admission_type) OVER (PARTITION BY subject_id ORDER BY admittime) AS next_admission_type
+  FROM adm
+)
+SELECT
+  subject_id, hadm_id,
+  CASE WHEN next_admittime IS NOT NULL
+        AND TIMESTAMP_DIFF(next_admittime, dischtime, DAY) <= 30
+        AND LOWER(next_admission_type) NOT LIKE '%elective%'
+       THEN 1 ELSE 0 END AS readmit_30d
+FROM seq;
+
+```
+
+## ⚡ 3. Early-Warning Monitoring Plan
+
+**Goal:** Identify instability prior to ICU discharge (for patients already transferred).
+
+WITH idx AS (
+SELECT subject_id, hadm_id, stay_id, outtime AS t0_transfer
+FROM `physionet-data.mimiciv_3_1_icu.icustays`
+WHERE outtime IS NOT NULL
+),
+vital_items AS (
+SELECT itemid, 'HR' AS var FROM `physionet-data.mimiciv_3_1_icu.d_items` WHERE LOWER(label)='heart rate'
+UNION ALL SELECT itemid, 'RR' FROM `physionet-data.mimiciv_3_1_icu.d_items` WHERE LOWER(label)='respiratory rate'
+UNION ALL SELECT itemid, 'MAP' FROM `physionet-data.mimiciv_3_1_icu.d_items` WHERE LOWER(label) LIKE '%mean bp%'
+),
+win AS (
+SELECT i.subject_id, i.hadm_id, i.stay_id, i.t0_transfer, vi.var, c.charttime, c.valuenum
+FROM idx i
+JOIN `physionet-data.mimiciv_3_1_icu.chartevents` c USING (subject_id, hadm_id, stay_id)
+JOIN vital_items vi USING (itemid)
+WHERE c.valuenum IS NOT NULL
+AND c.charttime BETWEEN TIMESTAMP_SUB(i.t0_transfer, INTERVAL 6 HOUR) AND i.t0_transfer
+),
+stats AS (
+SELECT
+subject_id, hadm_id, stay_id, var,
+AVG(valuenum) AS mean_v, STDDEV(valuenum) AS sd_v
+FROM win
+GROUP BY subject_id, hadm_id, stay_id, var
+)
+SELECT *, SAFE_DIVIDE(sd_v, mean_v) AS cv_vital FROM stats;
+
+## 🧰 4. Policy Optimization (Observation Window)
+
+**Goal:** Find optimal safe time gap between last intervention (extubation or pressor-off) and ICU discharge.
+
+WITH icu AS (
+SELECT subject_id, hadm_id, stay_id, outtime AS t0_transfer
+FROM `physionet-data.mimiciv_3_1_icu.icustays`
+),
+pressor_items AS (
+SELECT itemid FROM `physionet-data.mimiciv_3_1_icu.d_items`
+WHERE LOWER(label) IN ('norepinephrine','epinephrine','phenylephrine','dopamine','vasopressin')
+),
+pressors AS (
+SELECT i.subject_id, i.hadm_id, i.stay_id, i.t0_transfer,
+MAX(ie.endtime) AS last_presser_end
+FROM icu i
+JOIN `physionet-data.mimiciv_3_1_icu.inputevents` ie USING (subject_id, hadm_id, stay_id)
+JOIN pressor_items pi ON pi.itemid=ie.itemid
+WHERE ie.endtime < i.t0_transfer
+GROUP BY i.subject_id, i.hadm_id, i.stay_id, i.t0_transfer
+)
+SELECT *,
+TIMESTAMP_DIFF(t0_transfer, last_presser_end, HOUR) AS hours_since_presser_off
+FROM pressors;
+
+## ⚖️ 5. Equity Audit Dashboard
+
+**Goal:** Identify if model performance or outcomes vary by demographic group.
+
+## 6. Financial & Capacity Planning
+
+**Goal:** Quantify business impact — cost avoidance and freed ICU bed-days.
+
+WITH base AS (
+SELECT
+subject_id, hadm_id, stay_id,
+TIMESTAMP_DIFF(outtime, intime, HOUR)/24 AS icu_los_days,
+-- ⚠️ temporary placeholder: randomly mark ~8% as readmitted
+IF(RAND() < 0.08, 1, 0) AS readmit_24h
+FROM `physionet-data.mimiciv_3_1_icu.icustays`
+),
+impact AS (
+SELECT
+COUNTIF(readmit_24h = 1) AS num_rapid_readmits,
+COUNT(*) AS total_transfers,
+AVG(icu_los_days) AS avg_icu_los
+FROM base
+)
+SELECT
+num_rapid_readmits,
+total_transfers,
+ROUND(num_rapid_readmits * 1.0 / total_transfers, 3) AS rapid_readmit_rate,
+ROUND(num_rapid_readmits * avg_icu_los, 1) AS bed_days_lost,
+ROUND(num_rapid_readmits * avg_icu_los * 5000, 2) AS cost_estimated
+FROM impact;
+
+intubations or extubations are logged as **procedures**.
+
+SELECT
+subject_id, hadm_id, stay_id,
+starttime, endtime, itemid, value
+FROM `physionet-data.mimiciv_3_1_icu.procedureevents`
+WHERE itemid IN (
+SELECT itemid
+FROM `physionet-data.mimiciv_3_1_icu.d_items`
+WHERE LOWER(label) LIKE '%intubat%'
+OR LOWER(label) LIKE '%extubat%'
+);
+
+**last extubation** and **first intubation** times:
+
+WITH events AS (
+SELECT subject_id, hadm_id, stay_id, charttime, label
+FROM `physionet-data.mimiciv_3_1_icu.chartevents` c
+JOIN `physionet-data.mimiciv_3_1_icu.d_items` d
+ON c.itemid = d.itemid
+WHERE LOWER(d.label) LIKE '%intubat%' OR LOWER(d.label) LIKE '%extubat%'
+)
+SELECT
+subject_id, hadm_id, stay_id,
+MAX(CASE WHEN LOWER(label) LIKE '%extubat%' THEN charttime END) AS last_extubation,
+MIN(CASE WHEN LOWER(label) LIKE '%intubat%' THEN charttime END) AS first_intubation
+FROM events
+GROUP BY subject_id, hadm_id, stay_id;
+
+How many have a next ICU within 72h?
+
+WITH x AS (
+SELECT
+outtime,
+LEAD(intime) OVER (PARTITION BY subject_id, hadm_id ORDER BY intime) AS next_icu_in
+FROM `physionet-data.mimiciv_3_1_icu.icustays`
+WHERE outtime IS NOT NULL
+)
+SELECT
+COUNTIF(next_icu_in IS NOT NULL) AS has_next_same_hadm,
+COUNTIF(next_icu_in IS NOT NULL AND TIMESTAMP_DIFF(next_icu_in, outtime, HOUR) <= 24) AS within_24h,
+COUNTIF(next_icu_in IS NOT NULL AND TIMESTAMP_DIFF(next_icu_in, outtime, HOUR) <= 72) AS within_72h
+FROM x;
+
+- builds an **ICU → floor transfer** cohort (uses `mimiciv_3_1_hosp.transfers` to identify the **first non-ICU** unit after ICU outtime),
+- then finds the **next ICU stay** within the **same hospitalization** (same `hadm_id`),
+- and finally labels **rapid ICU readmission** at **≤24h** and **≤72h**.
+
+```
+-- ICU -> FLOOR cohort + next ICU labels (24h / 72h) — MIMIC-IV v3.1
+WITH icu_stays AS (
+  SELECT subject_id, hadm_id, stay_id, intime, outtime
+  FROM `physionet-data.mimiciv_3_1_icu.icustays`
+  WHERE outtime IS NOT NULL
+),
+-- What counts as an ICU careunit string in transfers
+icu_units AS (
+  SELECT DISTINCT careunit AS icu_unit
+  FROM `physionet-data.mimiciv_3_1_hosp.transfers`
+  WHERE careunit IS NOT NULL AND LOWER(careunit) LIKE '%icu%'
+),
+-- All transfer segments that start at/after the ICU outtime within the same hospital admission
+post_icu_segments AS (
+  SELECT
+    s.subject_id, s.hadm_id, s.stay_id,
+    s.outtime AS t0_transfer,
+    t.careunit, t.intime AS seg_start, t.outtime AS seg_end
+  FROM icu_stays s
+  JOIN `physionet-data.mimiciv_3_1_hosp.transfers` t
+    ON t.subject_id = s.subject_id
+   AND t.hadm_id    = s.hadm_id
+   AND t.intime    >= s.outtime
+),
+-- First destination after ICU (the very next segment)
+first_after_icu AS (
+  SELECT
+    subject_id, hadm_id, stay_id, t0_transfer,
+    ARRAY_AGG(STRUCT(careunit, seg_start, seg_end) ORDER BY seg_start ASC)[SAFE_OFFSET(0)] AS first_seg
+  FROM post_icu_segments
+  GROUP BY subject_id, hadm_id, stay_id, t0_transfer
+),
+-- Label which of those first destinations are "floor" (non-ICU)
+icufloor AS (
+  SELECT
+    f.subject_id, f.hadm_id, f.stay_id, f.t0_transfer,
+    f.first_seg.careunit         AS first_careunit_after_icu,
+    f.first_seg.seg_start        AS first_seg_start,
+    f.first_seg.seg_end          AS first_seg_end,
+    CASE WHEN u.icu_unit IS NULL THEN 1 ELSE 0 END AS to_floor
+  FROM first_after_icu f
+  LEFT JOIN icu_units u
+    ON f.first_seg.careunit = u.icu_unit
+),
+-- Next ICU entry for the same hospitalization AFTER the ICU->floor transfer
+next_icu AS (
+  SELECT
+    i.subject_id, i.hadm_id, i.stay_id, i.t0_transfer,
+    MIN(s2.intime) AS next_icu_in
+  FROM icufloor i
+  LEFT JOIN `physionet-data.mimiciv_3_1_icu.icustays` s2
+    ON s2.subject_id = i.subject_id
+   AND s2.hadm_id    = i.hadm_id
+   AND s2.intime    > i.t0_transfer
+  GROUP BY i.subject_id, i.hadm_id, i.stay_id, i.t0_transfer
+)
+SELECT
+  d.subject_id,
+  d.hadm_id,
+  d.stay_id,
+  d.t0_transfer,
+  d.first_careunit_after_icu,
+  d.first_seg_start,
+  d.first_seg_end,
+  d.to_floor,
+  n.next_icu_in,
+  -- Debug: hours to next ICU (NULL if no return during same hadm)
+  TIMESTAMP_DIFF(n.next_icu_in, d.t0_transfer, HOUR) AS hours_to_next_icu,
+  -- Labels (only meaningful when to_floor = 1)
+  CASE
+    WHEN d.to_floor = 1
+     AND n.next_icu_in IS NOT NULL
+     AND TIMESTAMP_DIFF(n.next_icu_in, d.t0_transfer, HOUR) BETWEEN 0 AND 24
+    THEN 1 ELSE 0 END AS label_readmit_24h,
+  CASE
+    WHEN d.to_floor = 1
+     AND n.next_icu_in IS NOT NULL
+     AND TIMESTAMP_DIFF(n.next_icu_in, d.t0_transfer, HOUR) BETWEEN 0 AND 72
+    THEN 1 ELSE 0 END AS label_readmit_72h
+FROM icufloor d
+LEFT JOIN next_icu n
+  USING (subject_id, hadm_id, stay_id, t0_transfer)
+WHERE d.to_floor = 1     -- 🔒 keep only ICU -> floor transfers
+ORDER BY d.subject_id, d.hadm_id, d.t0_transfer;
+
+```
+
+WITH icu_stays AS (
+SELECT subject_id, hadm_id, stay_id, intime, outtime
+FROM `physionet-data.mimiciv_3_1_icu.icustays`
+WHERE outtime IS NOT NULL
+),
+next_icu AS (
+SELECT
+a.subject_id, a.hadm_id, a.stay_id,
+a.outtime AS t0_transfer,
+MIN(b.intime) AS next_icu_in
+FROM icu_stays a
+LEFT JOIN `physionet-data.mimiciv_3_1_icu.icustays` b
+ON b.subject_id = a.subject_id
+AND b.hadm_id    = a.hadm_id
+AND b.intime     > a.outtime
+GROUP BY a.subject_id, a.hadm_id, a.stay_id, a.outtime
+),
+cohort AS (
+SELECT
+subject_id, hadm_id, stay_id, t0_transfer, next_icu_in,
+TIMESTAMP_DIFF(next_icu_in, t0_transfer, HOUR) AS hours_to_next_icu,
+CASE WHEN next_icu_in IS NOT NULL
+AND TIMESTAMP_DIFF(next_icu_in, t0_transfer, HOUR) BETWEEN 0 AND 24
+THEN 1 ELSE 0 END AS label_readmit_24h,
+CASE WHEN next_icu_in IS NOT NULL
+AND TIMESTAMP_DIFF(next_icu_in, t0_transfer, HOUR) BETWEEN 0 AND 72
+THEN 1 ELSE 0 END AS label_readmit_72h
+FROM next_icu
+WHERE next_icu_in IS NOT NULL
+AND TIMESTAMP_DIFF(next_icu_in, t0_transfer, HOUR) BETWEEN 0 AND 48
+),
+patient_info AS (
+SELECT
+p.subject_id,
+p.gender,
+p.anchor_age,
+p.anchor_year,
+p.dod,
+a.hadm_id,
+a.admittime,
+a.dischtime,
+a.deathtime,
+a.insurance,
+a.language,
+a.marital_status
+FROM `physionet-data.mimiciv_3_1_hosp.patients`   p
+JOIN `physionet-data.mimiciv_3_1_hosp.admissions` a
+ON a.subject_id = p.subject_id
+),
+vital_items AS (
+SELECT itemid, 'HR'  AS var FROM `physionet-data.mimiciv_3_1_icu.d_items` WHERE LOWER(label) = 'heart rate'
+UNION ALL SELECT itemid, 'RR'  FROM `physionet-data.mimiciv_3_1_icu.d_items` WHERE LOWER(label) = 'respiratory rate'
+UNION ALL SELECT itemid, 'MAP' FROM `physionet-data.mimiciv_3_1_icu.d_items`
+WHERE LOWER(label) IN ('non invasive blood pressure mean','mean bp','map (mmhg)')
+),
+vitals_6h AS (
+SELECT
+c.subject_id, c.hadm_id, c.stay_id,
+v.var, c.charttime, c.valuenum
+FROM `physionet-data.mimiciv_3_1_icu.chartevents` c
+JOIN vital_items v ON v.itemid = c.itemid
+JOIN cohort x
+ON x.subject_id = c.subject_id
+AND x.hadm_id    = c.hadm_id
+AND x.stay_id    = c.stay_id
+WHERE c.valuenum IS NOT NULL
+AND c.charttime >= TIMESTAMP_SUB(x.t0_transfer, INTERVAL 6 HOUR)
+AND c.charttime <  x.t0_transfer
+),
+vitals_packed AS (
+SELECT
+subject_id, hadm_id, stay_id, var,
+ARRAY_AGG(valuenum ORDER BY charttime) AS vals,
+ARRAY_REVERSE(ARRAY_AGG(valuenum ORDER BY charttime))[SAFE_OFFSET(0)] AS last_val
+FROM vitals_6h
+GROUP BY subject_id, hadm_id, stay_id, var
+),
+vitals_features AS (
+SELECT
+subject_id, hadm_id, stay_id,
+MAX(IF(var='HR',  last_val, NULL))  AS hr_last,
+MAX(IF(var='RR',  last_val, NULL))  AS rr_last,
+MAX(IF(var='MAP', last_val, NULL))  AS map_last,
+MAX(IF(var='HR',  (SELECT SAFE_DIVIDE(STDDEV_SAMP(x), NULLIF(AVG(x),0)) FROM UNNEST(vals) x), NULL))  AS hr_cv6h,
+MAX(IF(var='RR',  (SELECT SAFE_DIVIDE(STDDEV_SAMP(x), NULLIF(AVG(x),0)) FROM UNNEST(vals) x), NULL))  AS rr_cv6h,
+MAX(IF(var='MAP', (SELECT SAFE_DIVIDE(STDDEV_SAMP(x), NULLIF(AVG(x),0)) FROM UNNEST(vals) x), NULL))  AS map_cv6h
+FROM vitals_packed
+GROUP BY subject_id, hadm_id, stay_id
+)
+SELECT
+x.subject_id, x.hadm_id, x.stay_id,
+x.t0_transfer, x.next_icu_in, x.hours_to_next_icu,
+x.label_readmit_24h, x.label_readmit_72h,
+
+- - patient/admission context (no ethnicity column)
+pi.gender,
+pi.language,
+pi.marital_status,
+pi.insurance,
+pi.admittime,
+pi.dischtime,
+pi.deathtime,
+pi.dod,
+SAFE_CAST(pi.anchor_age AS INT64) + (EXTRACT(YEAR FROM x.t0_transfer) - pi.anchor_year) AS age_at_transfer,
+- - vitals features
+vf.hr_last, vf.rr_last, vf.map_last, vf.hr_cv6h, vf.rr_cv6h, vf.map_cv6h
+
+FROM cohort x
+JOIN patient_info   pi ON pi.subject_id = x.subject_id AND pi.hadm_id = x.hadm_id
+LEFT JOIN vitals_features vf ON vf.subject_id = x.subject_id AND vf.hadm_id = x.hadm_id AND vf.stay_id = x.stay_id
+ORDER BY x.subject_id, x.hadm_id, x.t0_transfer;
